@@ -200,6 +200,22 @@ class BaseTrainer:
 
             self.optimizer = OptimizerPlugin(self.args.optim_config.name)(self.model, self.args.optim_config)
 
+    def _should_defer_fsdp_grad_accum(self, num_micro: int) -> bool:
+        """Whether to defer FSDP2 HSDP cross-replica all-reduce until the last microbatch.
+
+        Returns True only when all of the following hold:
+        * We are not running under DeepSpeed (which already manages sync via accelerator).
+        * There is more than one microbatch per optimizer step (otherwise the deferral is a no-op).
+        * The model exposes the FSDP2 hooks `set_requires_all_reduce` / `set_is_last_backward`.
+        * `LLAMAFACTORY_V1_FSDP_HSDP_GRAD_ACCUM` is not set to a falsy value
+          (`0`, `false`, `no`, `off`; case-insensitive).
+        """
+        if self._deepspeed_engine is not None or num_micro <= 1:
+            return False
+        if os.environ.get("LLAMAFACTORY_V1_FSDP_HSDP_GRAD_ACCUM", "1").lower() in ("0", "false", "no", "off"):
+            return False
+        return hasattr(self.model, "set_requires_all_reduce") and hasattr(self.model, "set_is_last_backward")
+
     def _init_lr_scheduler(self) -> None:
         """Init lr scheduler."""
         if self.args.lr_scheduler_config is None:
@@ -269,14 +285,7 @@ class BaseTrainer:
                 # keeps the cheap intra-node reduce-scatter every backward but skips the expensive
                 # inter-node all-reduce; set_is_last_backward(False) avoids the per-microbatch
                 # synchronous wait. Disable via LLAMAFACTORY_V1_FSDP_HSDP_GRAD_ACCUM=0 if needed.
-                fsdp_grad_accum = (
-                    self._deepspeed_engine is None
-                    and num_micro > 1
-                    and os.environ.get("LLAMAFACTORY_V1_FSDP_HSDP_GRAD_ACCUM", "1").lower()
-                    not in ("0", "false", "no", "off")
-                    and hasattr(self.model, "set_requires_all_reduce")
-                    and hasattr(self.model, "set_is_last_backward")
-                )
+                fsdp_grad_accum = self._should_defer_fsdp_grad_accum(num_micro)
                 for i, micro_batch in enumerate(micro_batches):
                     is_last_micro = i == num_micro - 1
                     if fsdp_grad_accum:
