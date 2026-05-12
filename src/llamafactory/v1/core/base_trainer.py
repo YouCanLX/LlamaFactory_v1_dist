@@ -259,7 +259,30 @@ class BaseTrainer:
                 step_valid_tokens = compute_valid_tokens(micro_batches)
                 step_valid_tokens = DistributedInterface().all_reduce(step_valid_tokens, op=ReduceOp.SUM)
                 num_micro = len(micro_batches)
+                # FSDP2 (HSDP) gradient accumulation: by default every loss.backward() triggers a
+                # per-FSDP-unit cross-replica all-reduce of grads (and a per-backward sync wait),
+                # so on multi-node HSDP every microbatch crosses the inter-node link N-1 times per
+                # layer. With NNODES microbatches/optimizer-step that erases the benefit of adding
+                # nodes (e.g. 2-node and 4-node both end up at the same step time). Match the
+                # DeepSpeed branch's behavior by deferring the cross-replica all-reduce and the
+                # backward sync to the final microbatch only. set_requires_all_reduce(False)
+                # keeps the cheap intra-node reduce-scatter every backward but skips the expensive
+                # inter-node all-reduce; set_is_last_backward(False) avoids the per-microbatch
+                # synchronous wait. Disable via LLAMAFACTORY_V1_FSDP_HSDP_GRAD_ACCUM=0 if needed.
+                fsdp_grad_accum = (
+                    self._deepspeed_engine is None
+                    and num_micro > 1
+                    and os.environ.get("LLAMAFACTORY_V1_FSDP_HSDP_GRAD_ACCUM", "1").lower()
+                    not in ("0", "false", "no", "off")
+                    and hasattr(self.model, "set_requires_all_reduce")
+                    and hasattr(self.model, "set_is_last_backward")
+                )
                 for i, micro_batch in enumerate(micro_batches):
+                    is_last_micro = i == num_micro - 1
+                    if fsdp_grad_accum:
+                        self.model.set_requires_all_reduce(is_last_micro)
+                        self.model.set_is_last_backward(is_last_micro)
+
                     if self.args.dist_config and self.args.dist_config.get("cp_size", 1) > 1:
                         from ..plugins.model_plugins.parallelization.sequence_parallel import (
                             SequenceParallelLossPlugin,
@@ -274,7 +297,7 @@ class BaseTrainer:
 
                     if self._deepspeed_engine is not None:
                         # deepspeed: set sync_gradients so engine.step() only fires on last micro-batch
-                        self._deepspeed_engine.accelerator.sync_gradients = i == num_micro - 1
+                        self._deepspeed_engine.accelerator.sync_gradients = is_last_micro
                         self._deepspeed_engine.backward(loss)
                     else:
                         loss.backward()
