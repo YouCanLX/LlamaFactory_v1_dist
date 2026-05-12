@@ -207,7 +207,7 @@ class BaseTrainer:
         elif self.args.lr_scheduler_config.name == "cosine":
             self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
-                T_max=max(1, self.args.num_train_epochs),
+                T_max=max(1, self.num_training_steps),
                 eta_min=self.args.lr_scheduler_config.get("eta_min", 0.0),
             )
         else:
