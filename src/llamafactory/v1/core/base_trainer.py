@@ -28,6 +28,7 @@ Train Phase:
 """
 
 from abc import abstractmethod
+import os
 
 import torch
 import torch.nn.functional as F
@@ -143,7 +144,15 @@ class BaseTrainer:
                 )
             from ..plugins.model_plugins.parallelization.sequence_parallel import SequenceParallelModelPlugin
 
-            if model.config._attn_implementation != "flash_attention_2":
+            user_attn = os.environ.get("LLAMAFACTORY_V1_ATTN_IMPLEMENTATION")
+            if user_attn:
+                model.config._attn_implementation = user_attn
+                setattr(model.config, "attn_implementation", user_attn)
+                logger.warning_rank0(
+                    f"LLAMAFACTORY_V1_ATTN_IMPLEMENTATION={user_attn!r}: not forcing flash_attention_2 for CP. "
+                    "Ulysses CP is only validated with FlashAttention; training may fail if incompatible."
+                )
+            elif model.config._attn_implementation != "flash_attention_2":
                 logger.warning_rank0(
                     "Sequence parallelism is optimized for flash attention only. Replace the attention implementation to flash_attention_2."
                 )
