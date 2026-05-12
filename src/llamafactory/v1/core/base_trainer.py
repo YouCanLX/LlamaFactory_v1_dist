@@ -204,6 +204,12 @@ class BaseTrainer:
         """Init lr scheduler."""
         if self.args.lr_scheduler_config is None:
             self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda x: 1.0)
+        elif self.args.lr_scheduler_config.name == "cosine":
+            self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=max(1, self.args.num_train_epochs),
+                eta_min=self.args.lr_scheduler_config.get("eta_min", 0.0),
+            )
         else:
             from ..plugins.trainer_plugins.lr_scheduler import LRSchedulerPlugin
 
