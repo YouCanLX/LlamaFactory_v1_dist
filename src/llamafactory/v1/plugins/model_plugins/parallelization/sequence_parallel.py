@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import sys
 from functools import partial
 
@@ -34,6 +35,42 @@ from .ulysses import (
 
 
 logger = logging.get_logger(__name__)
+
+
+def _cross_entropy_none_chunked(
+    shift_logits: torch.Tensor, shift_labels: torch.Tensor, batch_size: int
+) -> torch.Tensor:
+    """Cross-entropy with reduction='none', chunked along the token dimension.
+
+    At 70k ctx + CP the per-rank token count is still huge; a single
+    F.cross_entropy(..., reduction='none') can reserve ~20 GiB for the softmax
+    workspace. Chunking caps peak memory without changing numerics. Keep the
+    full logits tensor in its model dtype and cast each slice to fp32 here, so
+    we do not materialize the entire [tokens, vocab] matrix in fp32.
+    Override chunk size via LLAMAFACTORY_V1_CE_CHUNK_SIZE (0 disables chunking).
+    """
+    num_tokens = shift_logits.size(0)
+    chunk_size = int(os.environ.get("LLAMAFACTORY_V1_CE_CHUNK_SIZE", "4096"))
+    if chunk_size <= 0 or num_tokens <= chunk_size:
+        return -F.cross_entropy(shift_logits.float(), shift_labels, reduction="none").view(batch_size, -1)
+
+    chunks: list[torch.Tensor] = []
+    start = 0
+    min_chunk_size = int(os.environ.get("LLAMAFACTORY_V1_CE_MIN_CHUNK_SIZE", "512"))
+    while start < num_tokens:
+        end = min(start + chunk_size, num_tokens)
+        try:
+            chunks.append(
+                -F.cross_entropy(shift_logits[start:end].float(), shift_labels[start:end], reduction="none")
+            )
+            start = end
+        except torch.OutOfMemoryError:
+            if chunk_size <= min_chunk_size:
+                raise
+            torch.cuda.empty_cache()
+            chunk_size = max(min_chunk_size, chunk_size // 2)
+            logger.warning_rank0(f"Reducing sequence-parallel CE chunk size to {chunk_size} after CUDA OOM.")
+    return torch.cat(chunks).view(batch_size, -1)
 
 
 class SequenceParallelModelPlugin(BasePlugin):
@@ -168,7 +205,7 @@ def sequence_parallel_loss(model, model_inputs):
 
     outputs: ModelOutput = model(**model_inputs)
 
-    logits = outputs.logits.float()
+    logits = outputs.logits
 
     labels = model_inputs["labels"]
 
@@ -183,6 +220,7 @@ def sequence_parallel_loss(model, model_inputs):
     shift_labels = labels[..., 1:].contiguous()
     shift_labels = F.pad(shift_labels, (0, 1), value=-100)
     shift_labels = torch.chunk(shift_labels, chunks=cp_world_size, dim=1)[cp_rank].contiguous()
+    del global_labels, labels
 
     # use all_gather to collect loss_weights from all sequence parallel processes
     loss_weights = model_inputs["loss_weights"]
@@ -190,12 +228,13 @@ def sequence_parallel_loss(model, model_inputs):
     dist.all_gather(global_loss_weights, loss_weights, group=cp_group)
     shift_loss_weights = torch.cat(global_loss_weights, dim=1).contiguous()
     shift_loss_weights = shift_loss_weights[..., 1:].contiguous()
+    del global_loss_weights, loss_weights
 
     shift_logits = logits.view(-1, logits.size(-1)).contiguous()
     shift_labels = shift_labels.view(-1).contiguous()
 
     # use all_gather to collect log_probs from all sequence parallel processes
-    log_probs = -F.cross_entropy(shift_logits, shift_labels, reduction="none").view(batch_size, -1)
+    log_probs = _cross_entropy_none_chunked(shift_logits, shift_labels, batch_size)
     global_log_probs = dist.nn.all_gather(log_probs, group=cp_group)
     global_log_probs = torch.cat(global_log_probs, dim=1).contiguous()
     log_probs = global_log_probs[..., :-1].contiguous()
