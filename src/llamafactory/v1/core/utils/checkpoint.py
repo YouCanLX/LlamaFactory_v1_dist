@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Checkpoint utilities: low-level helpers and full training save/resume orchestration."""
-
+import gc
 import glob
 import json
 import os
@@ -279,6 +279,14 @@ class TrainingCheckpointCoordinator:
             save_rng_state(ckpt_dir, rank)
 
         DistributedInterface().sync()
+    
+        # DCP gather can leave the device nearly full; the next training step's CP
+        # cross-entropy needs a large contiguous allocation. Release cached blocks
+        # on every rank before resuming the step loop.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
 
         if rank == 0:
             mark_checkpoint_complete(ckpt_dir)
